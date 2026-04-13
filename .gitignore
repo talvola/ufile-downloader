@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.browser_profile/
+sample.html
