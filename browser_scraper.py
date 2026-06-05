@@ -68,6 +68,54 @@ def scrape_folder(folder_slug: str) -> tuple[str, list[dict]]:
     return folder_name, files
 
 
+def scrape_file(file_slug: str) -> tuple[str, list[dict]]:
+    """
+    Use a headless browser to load ufile.io/{file_slug} and extract
+    metadata for a single file.
+
+    Returns (file_name, [one_file_dict]).
+    The file dict mirrors what scrape_folder yields per file:
+    name, path, link, size, create_time.
+    """
+    if sync_playwright is None:
+        raise RuntimeError(
+            "playwright is not installed. Install it with:\n"
+            "  pip install playwright && python -m playwright install chromium"
+        )
+
+    url = f"https://ufile.io/{file_slug}"
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+        )
+        page = context.new_page()
+        page.on("dialog", lambda dialog: dialog.dismiss())
+
+        print(f"  Loading file page: {url}")
+        page.goto(url, wait_until="networkidle", timeout=60000)
+
+        name = _extract_file_page_name(page, file_slug)
+        size = _extract_file_page_size(page)
+        create_time = _extract_create_time(page)
+
+        browser.close()
+
+    return name, [{
+        "name": name,
+        "path": name,
+        "link": url,
+        "size": size,
+        "create_time": create_time,
+    }]
+
+
 def download_files_via_browser(files: list[dict], output_dir: str) -> dict:
     """
     Open a visible (headed) browser and download each file through the
@@ -285,6 +333,56 @@ def _extract_create_time(page: Page) -> float | None:
     except Exception:
         pass
     return None
+
+
+def _extract_file_page_name(page: Page, fallback_slug: str) -> str:
+    """Extract the filename shown on a single-file page."""
+    # Strategy 1: data-filename attribute on the download button
+    try:
+        el = page.query_selector("a.slow-download-button.free-download, a[data-filename]")
+        if el:
+            fn = el.get_attribute("data-filename")
+            if fn and fn.strip():
+                return fn.strip()
+    except Exception:
+        pass
+
+    # Strategy 2: common filename selectors on the page
+    for sel in [
+        ".file-name", ".filename", "h1.name", "h1.filename",
+        ".name", "h1", "h2",
+    ]:
+        try:
+            el = page.query_selector(sel)
+            if not el:
+                continue
+            text = (el.inner_text() or "").split("\n")[0].strip()
+            if text and "." in text and len(text) < 300 and not text.lower().startswith("ufile"):
+                return text
+        except Exception:
+            continue
+
+    # Strategy 3: page title, stripped of site suffix
+    try:
+        title = (page.title() or "").strip()
+        for sep in [" - ", " | ", " — "]:
+            if sep in title:
+                title = title.split(sep)[0].strip()
+        if title and "." in title and len(title) < 300:
+            return title
+    except Exception:
+        pass
+
+    return fallback_slug
+
+
+def _extract_file_page_size(page: Page) -> int | None:
+    """Extract the file size shown on a single-file page."""
+    try:
+        text = page.inner_text("body")
+        return _parse_size(text)
+    except Exception:
+        return None
 
 
 def _set_file_time(path: str, timestamp: float):

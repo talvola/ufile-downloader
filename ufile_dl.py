@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-ufile_dl — Download and sync files from ufile.io folders.
+ufile_dl — Download and sync files from ufile.io folders or single files.
 
 Usage:
-    python ufile_dl.py goknh
-    python ufile_dl.py https://ufile.io/f/goknh
+    python ufile_dl.py goknh                          # folder by slug
+    python ufile_dl.py https://ufile.io/f/goknh       # folder by URL
+    python ufile_dl.py https://ufile.io/01hot8kn      # single file by URL
     python ufile_dl.py goknh --output /mnt/r/ufile
     python ufile_dl.py goknh --dry-run
 """
@@ -21,20 +22,30 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-from browser_scraper import scrape_folder, download_files_via_browser
+from browser_scraper import scrape_folder, scrape_file, download_files_via_browser
 from downloader import find_orphans
 
 
-def parse_folder_slug(input_str: str) -> str:
-    """Extract folder slug from a URL or bare slug string."""
-    # Full URL: https://ufile.io/f/goknh
+def parse_ufile_url(input_str: str) -> tuple[str, str]:
+    """
+    Parse a ufile.io URL or bare slug.
+
+    Returns (kind, slug) where kind is 'folder' or 'file':
+      - ufile.io/f/{slug}  → ('folder', slug)
+      - ufile.io/{slug}    → ('file', slug)
+      - bare slug          → length-based guess: 8 chars → 'file', else 'folder'
+                             (folder slugs observed at 5–6 chars, file slugs at 8)
+    """
     m = re.search(r"ufile\.io/f/([A-Za-z0-9_-]+)", input_str)
     if m:
-        return m.group(1)
-    # Bare slug
+        return "folder", m.group(1)
+    m = re.search(r"ufile\.io/([A-Za-z0-9_-]+)", input_str)
+    if m:
+        return "file", m.group(1)
     if re.match(r"^[A-Za-z0-9_-]+$", input_str):
-        return input_str
-    raise ValueError(f"Cannot parse folder slug from: {input_str}")
+        kind = "file" if len(input_str) >= 8 else "folder"
+        return kind, input_str
+    raise ValueError(f"Cannot parse ufile URL: {input_str}")
 
 
 def main():
@@ -44,8 +55,9 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument(
-        "folder",
-        help="Ufile folder slug or URL (e.g. goknh or https://ufile.io/f/goknh)",
+        "target",
+        help="Ufile folder slug/URL or single-file URL "
+             "(e.g. goknh, https://ufile.io/f/goknh, https://ufile.io/01hot8kn)",
     )
     parser.add_argument(
         "-o", "--output",
@@ -59,27 +71,44 @@ def main():
     )
     args = parser.parse_args()
 
-    folder_slug = parse_folder_slug(args.folder)
-    print(f"Folder slug: {folder_slug}")
+    kind, slug = parse_ufile_url(args.target)
+    print(f"Target: {kind} — {slug}")
 
-    # --- Phase 1: Scrape folder page (headless) ---
-    print("\nScraping folder listing...")
-    try:
-        folder_name, files = scrape_folder(folder_slug)
-        print(f"  Folder: {folder_name}")
-        print(f"  Files found: {len(files)}")
-    except Exception as e:
-        print(f"  Browser scraping failed: {e}")
-        sys.exit(1)
+    # --- Phase 1: Scrape (headless) ---
+    if kind == "folder":
+        print("\nScraping folder listing...")
+        try:
+            folder_name, files = scrape_folder(slug)
+            print(f"  Folder: {folder_name}")
+            print(f"  Files found: {len(files)}")
+        except Exception as e:
+            print(f"  Browser scraping failed: {e}")
+            sys.exit(1)
 
-    if not files:
-        print("No files found. The folder may be empty, removed, or expired.")
-        sys.exit(1)
+        if not files:
+            print("No files found. The folder may be empty, removed, or expired.")
+            sys.exit(1)
 
-    # --- Determine output directory ---
-    if not folder_name or folder_name == folder_slug or folder_name.isdigit():
-        folder_name = folder_slug
-    output_dir = os.path.join(args.output, folder_name)
+        if not folder_name or folder_name == slug or folder_name.isdigit():
+            folder_name = slug
+        output_dir = os.path.join(args.output, folder_name)
+    else:  # single file
+        print("\nScraping file page...")
+        try:
+            _, files = scrape_file(slug)
+            if files:
+                print(f"  File: {files[0]['name']}")
+        except Exception as e:
+            print(f"  Browser scraping failed: {e}")
+            sys.exit(1)
+
+        if not files:
+            print("No file found. The file may be removed or expired.")
+            sys.exit(1)
+
+        # Single file goes directly into the output base dir, no subfolder
+        output_dir = args.output
+
     print(f"\nOutput directory: {output_dir}")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -104,9 +133,14 @@ def main():
         for f in files_skipped:
             print(f"  SKIP: {f['name']}")
 
+    # Only check for orphans in folder mode — in single-file mode we'd flag
+    # every unrelated file in the output dir.
+    should_report_orphans = kind == "folder"
+
     if not files_to_download:
         print("\nAll files already downloaded.")
-        _report_orphans(files, output_dir)
+        if should_report_orphans:
+            _report_orphans(files, output_dir)
         return
 
     if args.dry_run:
@@ -114,7 +148,8 @@ def main():
         for f in files_to_download:
             size_str = _fmt_size(f.get("size"))
             print(f"  {f['name']} ({size_str})")
-        _report_orphans(files, output_dir)
+        if should_report_orphans:
+            _report_orphans(files, output_dir)
         return
 
     # --- Phase 2: Download files via headed browser ---
@@ -123,8 +158,8 @@ def main():
 
     print(f"\nDone: {result['downloaded']} downloaded, {len(files_skipped)} skipped, {result['errors']} errors")
 
-    # --- Check for orphaned local files ---
-    _report_orphans(files, output_dir)
+    if should_report_orphans:
+        _report_orphans(files, output_dir)
 
 
 def _report_orphans(files: list[dict], output_dir: str):
